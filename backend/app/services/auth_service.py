@@ -1,8 +1,8 @@
 """
-خدمة المصادقة: تسجيل، دخول، تحقق من JWT.
+خدمة المصادقة: تسجيل، دخول، تحقق من JWT، تحديث الرمز.
 """
 from typing import Optional
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from fastapi import HTTPException, status
 from app.core.security import (
     verify_password,
@@ -15,11 +15,19 @@ from app.models.user import User
 from app.models.company import Company, SubscriptionPlan
 from app.schemas.auth import RegisterRequest, LoginRequest, Token
 
+
 class AuthService:
     @staticmethod
-    def register_user(db: Session, request: RegisterRequest) -> User:
+    def register(db: Session, request: RegisterRequest) -> User:
+        """
+        تسجيل مستخدم جديد مع شركة افتراضية.
+        هذه الدالة هي الواجهة الأساسية المستخدمة في نقطة /register.
+        """
+        # التحقق من فريدة البريد الإلكتروني
         if db.query(User).filter(User.email == request.email).first():
             raise HTTPException(status_code=409, detail="البريد الإلكتروني مستخدم مسبقاً")
+        
+        # إنشاء شركة جديدة
         company = Company(
             name=request.company_name,
             commercial_register=request.commercial_register,
@@ -28,6 +36,8 @@ class AuthService:
         )
         db.add(company)
         db.flush()
+        
+        # إنشاء المستخدم
         user = User(
             email=request.email,
             hashed_password=get_password_hash(request.password),
@@ -39,10 +49,21 @@ class AuthService:
         db.add(user)
         db.commit()
         db.refresh(user)
+        
+        # إعادة تحميل المستخدم مع علاقة الشركة لتجنب LazyLoading
+        user = db.query(User).options(joinedload(User.company)).filter(User.id == user.id).first()
         return user
 
     @staticmethod
+    def register_user(db: Session, request: RegisterRequest) -> User:
+        """
+        نفس دالة register، مُبقاة للتوافق مع الإصدارات السابقة.
+        """
+        return AuthService.register(db, request)
+
+    @staticmethod
     def authenticate(db: Session, request: LoginRequest) -> Optional[User]:
+        """التحقق من صحة بيانات الدخول."""
         user = db.query(User).filter(User.email == request.email).first()
         if not user or not verify_password(request.password, user.hashed_password):
             return None
@@ -52,19 +73,46 @@ class AuthService:
 
     @staticmethod
     def create_tokens(user_id: int) -> Token:
+        """إنشاء رموز JWT للوصول والتحديث."""
         access_token = create_access_token(subject=str(user_id))
         refresh_token = create_refresh_token(subject=str(user_id))
         return Token(access_token=access_token, refresh_token=refresh_token, token_type="bearer")
 
     @staticmethod
+    def refresh_access_token(refresh_token: str) -> Token:
+        """
+        تحديث رمز الوصول باستخدام رمز التحديث.
+        يفك تشفير رمز التحديث، ويتحقق من صلاحيته، ثم يصدر رمز وصول جديد.
+        """
+        payload = decode_token(refresh_token)
+        if payload is None or payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="رمز التحديث غير صالح")
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="رمز التحديث غير صالح")
+        
+        # إصدار رمز وصول جديد (مع الحفاظ على نفس رمز التحديث)
+        new_access_token = create_access_token(subject=user_id)
+        return Token(
+            access_token=new_access_token,
+            refresh_token=refresh_token,  # الاحتفاظ برمز التحديث الحالي
+            token_type="bearer"
+        )
+
+    @staticmethod
     def get_current_user(db: Session, token: str) -> User:
+        """
+        استخراج المستخدم الحالي من رمز الوصول، مع تحميل علاقة الشركة.
+        """
         payload = decode_token(token)
         if payload is None or payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="رمز الوصول غير صالح")
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="رمز الوصول غير صالح")
-        user = db.query(User).filter(User.id == int(user_id)).first()
+        
+        # تحميل المستخدم مع علاقة الشركة لتجنب LazyLoading
+        user = db.query(User).options(joinedload(User.company)).filter(User.id == int(user_id)).first()
         if not user:
             raise HTTPException(status_code=404, detail="المستخدم غير موجود")
         if not user.is_active:
