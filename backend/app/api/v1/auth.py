@@ -3,7 +3,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.core.database import get_db
 from app.services.auth_service import AuthService
 from app.schemas.auth import RegisterRequest, Token, LoginRequest
@@ -94,12 +94,21 @@ def refresh_token(
     "/me",
     response_model=UserOut,
     summary="معلومات المستخدم الحالي",
-    description="إرجاع بيانات المستخدم المصادق عليه حالياً"
+    description="إرجاع بيانات المستخدم المصادق عليه حالياً مع بيانات الشركة"
 )
 def read_users_me(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
     """
     عرض بيانات المستخدم المسجل دخوله حالياً.
+    يتم جلب المستخدم مع علاقاته (مثل الشركة) لضمان اكتمال البيانات.
     """
-    return current_user
+    # إعادة جلب المستخدم من قاعدة البيانات مع تحميل علاقة الشركة
+    user = db.query(User).options(joinedload(User.company)).filter(User.id == current_user.id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="المستخدم غير موجود"
+        )
+    return user
